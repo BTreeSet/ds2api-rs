@@ -1,0 +1,145 @@
+--- src/handlers.rs
++++ src/handlers.rs
+@@ -431,20 +431,23 @@
+     for tool in tools {
+         if let Some(func) = tool.get("function") {
+             let name = func.get("name").and_then(|v| v.as_str()).unwrap_or("unknown");
+             let desc = func.get("description").and_then(|v| v.as_str()).unwrap_or("No description available");
+             let mut info = format!("Tool: {name}\nDescription: {desc}");
+
+-            if let Some(params) = func.get("parameters")
+-                && let Some(props) = params.get("properties").and_then(|v| v.as_object())
+-            {
+-                let required = params.get("required").and_then(|v| v.as_array()).map(|a| {
+-                    a.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>()
+-                }).unwrap_or_default();
+-
+-                let mut prop_strs = Vec::new();
+-                for (k, v) in props {
+-                    let p_type = v.get("type").and_then(|t| t.as_str()).unwrap_or("string");
+-                    let p_desc = v.get("description").and_then(|t| t.as_str()).unwrap_or("");
+-                    let is_req = if required.contains(&k.as_str()) { " (required)" } else { "" };
+-                    prop_strs.push(format!("  - {k}: {p_type}{is_req} - {p_desc}"));
+-                }
+-                if !prop_strs.is_empty() {
+-                    info.push_str("\nParameters:\n");
+-                    info.push_str(&prop_strs.join("\n"));
+-                }
++            if let Some(params) = func.get("parameters") {
++                if let Some(props) = params.get("properties").and_then(|v| v.as_object()) {
++                    let required = params.get("required").and_then(|v| v.as_array()).map(|a| {
++                        a.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>()
++                    }).unwrap_or_default();
++
++                    let mut prop_strs = Vec::new();
++                    for (k, v) in props {
++                        let p_type = v.get("type").and_then(|t| t.as_str()).unwrap_or("string");
++                        let p_desc = v.get("description").and_then(|t| t.as_str()).unwrap_or("");
++                        let is_req = if required.contains(&k.as_str()) { " (required)" } else { "" };
++                        prop_strs.push(format!("  - {k}: {p_type}{is_req} - {p_desc}"));
++                    }
++                    if !prop_strs.is_empty() {
++                        info.push_str("\nParameters:\n");
++                        info.push_str(&prop_strs.join("\n"));
++                    }
++                }
+             }
+             schemas.push(info);
+         }
+@@ -482,8 +485,9 @@
+         ));
+     }
+
+-    if let Some(tools) = &req.tools
+-        && !tools.is_empty()
+-    {
+-        inject_tools(&mut req.messages, tools);
++    if let Some(tools) = &req.tools {
++        if !tools.is_empty() {
++            inject_tools(&mut req.messages, tools);
++        }
+     }
+
+     let (token, account) = resolve_deepseek_token(&state, &headers).await?;
+@@ -505,17 +509,19 @@
+         let desc = tool.get("description").and_then(|v| v.as_str()).unwrap_or("No description available");
+         let mut info = format!("Tool: {name}\nDescription: {desc}");
+
+-        if let Some(schema) = tool.get("input_schema")
+-            && let Some(props) = schema.get("properties").and_then(|v| v.as_object())
+-        {
+-            let required = schema.get("required").and_then(|v| v.as_array()).map(|a| {
+-                a.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>()
+-            }).unwrap_or_default();
+-
+-            let mut prop_strs = Vec::new();
+-            for (k, v) in props {
+-                let p_type = v.get("type").and_then(|t| t.as_str()).unwrap_or("string");
+-                let is_req = if required.contains(&k.as_str()) { " (required)" } else { "" };
+-                prop_strs.push(format!("  - {k}: {p_type}{is_req}"));
+-            }
+-            if !prop_strs.is_empty() {
+-                info.push_str("\nParameters:\n");
+-                info.push_str(&prop_strs.join("\n"));
+-            }
++        if let Some(schema) = tool.get("input_schema") {
++            if let Some(props) = schema.get("properties").and_then(|v| v.as_object()) {
++                let required = schema.get("required").and_then(|v| v.as_array()).map(|a| {
++                    a.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>()
++                }).unwrap_or_default();
++
++                let mut prop_strs = Vec::new();
++                for (k, v) in props {
++                    let p_type = v.get("type").and_then(|t| t.as_str()).unwrap_or("string");
++                    let is_req = if required.contains(&k.as_str()) { " (required)" } else { "" };
++                    prop_strs.push(format!("  - {k}: {p_type}{is_req}"));
++                }
++                if !prop_strs.is_empty() {
++                    info.push_str("\nParameters:\n");
++                    info.push_str(&prop_strs.join("\n"));
++                }
++            }
+         }
+         schemas.push(info);
+     }
+@@ -575,8 +581,9 @@
+         });
+     }
+
+-    if let Some(tools) = &req.tools
+-        && !tools.is_empty()
+-    {
+-        inject_claude_tools(&mut messages, tools);
++    if let Some(tools) = &req.tools {
++        if !tools.is_empty() {
++            inject_claude_tools(&mut messages, tools);
++        }
+     }
+
+     let (fast_model, slow_model) = if let Some(mapping) = &state.config.claude_model_mapping {
+@@ -847,15 +854,17 @@
+     let mut tool_calls = None;
+     let mut remaining = content.to_string();
+
+-    if let Some(start_idx) = content.find("{\"tool_calls\":")
+-        && let Some(end_idx) = content[start_idx..].find("]}")
+-    {
+-        let full_end = start_idx + end_idx + 2;
+-        let matched = &content[start_idx..full_end];
+-        if let Ok(parsed) = serde_json::from_str::<Value>(matched)
+-            && let Some(calls) = parsed.get("tool_calls").and_then(|c| c.as_array())
+-        {
+-            tool_calls = Some(calls.clone());
+-            remaining = content.replace(matched, "").trim().to_string();
++    if let Some(start_idx) = content.find("{\"tool_calls\":") {
++        if let Some(end_idx) = content[start_idx..].find("]}") {
++            let full_end = start_idx + end_idx + 2;
++            let matched = &content[start_idx..full_end];
++            if let Ok(parsed) = serde_json::from_str::<Value>(matched) {
++                if let Some(calls) = parsed.get("tool_calls").and_then(|c| c.as_array()) {
++                    tool_calls = Some(calls.clone());
++                    remaining = content.replace(matched, "").trim().to_string();
++                }
++            }
+         }
+     }

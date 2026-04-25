@@ -1,5 +1,3 @@
-use std::io;
-
 use anyhow::{Context, anyhow};
 use axum::{
     body::Body,
@@ -359,16 +357,55 @@ async fn forward_to_deepseek(
         })?;
     let status = upstream.status();
 
+    let s_state = state.clone();
+    let s_token = token.to_string();
+    let s_session_id = session_id.clone();
+
     if req.stream {
-        let stream = upstream
-            .bytes_stream()
-            .map(|chunk| chunk.map_err(|err| io::Error::other(err.to_string())));
+        let mut stream = upstream.bytes_stream();
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<axum::body::Bytes, std::io::Error>>(100);
+
+        tokio::spawn(async move {
+            let mut acc_text = String::new();
+            while let Some(chunk_res) = stream.next().await {
+                if let Ok(chunk) = chunk_res {
+                    if let Ok(s) = std::str::from_utf8(&chunk) {
+                        acc_text.push_str(s);
+                    }
+                    let _ = tx.send(Ok(chunk)).await;
+                } else {
+                    let _ = tx.send(chunk_res.map_err(|e| std::io::Error::other(e.to_string()))).await;
+                }
+            }
+
+            let (tools, _) = detect_and_parse_tool_calls(&acc_text);
+            if let Some(tool_calls) = tools {
+                let tool_chunk = json!({
+                    "id": format!("msg_{}", uuid::Uuid::new_v4()),
+                    "object": "chat.completion.chunk",
+                    "created": 0,
+                    "model": "",
+                    "choices": [{
+                        "index": 0,
+                        "delta": {"tool_calls": tool_calls},
+                        "finish_reason": "tool_calls"
+                    }]
+                });
+                let sse = format!("data: {}\n\n", tool_chunk);
+                let _ = tx.send(Ok(axum::body::Bytes::from(sse))).await;
+            }
+
+            tokio::spawn(delete_session(s_state, s_token, s_session_id));
+        });
+
+        let out_stream = tokio_stream::wrappers::ReceiverStream::new(rx);
         return Response::builder()
             .status(status)
             .header("content-type", "text/event-stream")
             .header("cache-control", "no-cache")
             .header("connection", "keep-alive")
-            .body(Body::from_stream(stream))
+            .body(Body::from_stream(out_stream))
             .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()));
     }
 
@@ -377,6 +414,8 @@ async fn forward_to_deepseek(
         .await
         .map_err(|e| ApiError::new(StatusCode::BAD_GATEWAY, format!("failed to read body: {e}")))?;
 
+    tokio::spawn(delete_session(s_state, s_token, s_session_id));
+
     Response::builder()
         .status(status)
         .header("content-type", "application/json")
@@ -384,10 +423,56 @@ async fn forward_to_deepseek(
         .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
 }
 
+fn inject_tools(messages: &mut Vec<ChatMessage>, tools: &[Value]) {
+    let mut schemas = Vec::new();
+    for tool in tools {
+        if let Some(func) = tool.get("function") {
+            let name = func.get("name").and_then(|v| v.as_str()).unwrap_or("unknown");
+            let desc = func.get("description").and_then(|v| v.as_str()).unwrap_or("No description available");
+            let mut info = format!("Tool: {name}\nDescription: {desc}");
+
+            if let Some(params) = func.get("parameters")
+                && let Some(props) = params.get("properties").and_then(|v| v.as_object()) {
+                    let required = params.get("required").and_then(|v| v.as_array()).map(|a| {
+                        a.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>()
+                    }).unwrap_or_default();
+
+                    let mut prop_strs = Vec::new();
+                    for (k, v) in props {
+                        let p_type = v.get("type").and_then(|t| t.as_str()).unwrap_or("string");
+                        let p_desc = v.get("description").and_then(|t| t.as_str()).unwrap_or("");
+                        let is_req = if required.contains(&k.as_str()) { " (required)" } else { "" };
+                        prop_strs.push(format!("  - {k}: {p_type}{is_req} - {p_desc}"));
+                    }
+                    if !prop_strs.is_empty() {
+                        info.push_str("\nParameters:\n");
+                        info.push_str(&prop_strs.join("\n"));
+                    }
+                }
+            schemas.push(info);
+        }
+    }
+
+    let schema_str = schemas.join("\n\n");
+    let prompt = format!("You have access to the following tools:\n\n{schema_str}\n\nWhen you need to use a tool, respond with a JSON object in this exact format:\n{{\"tool_calls\": [{{\"id\": \"call_xxx\", \"type\": \"function\", \"function\": {{\"name\": \"tool_name\", \"arguments\": \"{{\\\"param\\\": \\\"value\\\"}}\"}}}}]}}\n\nYou can call multiple tools in one response by adding more objects to the tool_calls array.\nIMPORTANT: The \"arguments\" field must be a JSON string, not a JSON object.\n\nExample:\n{{\"tool_calls\": [{{\"id\": \"call_001\", \"type\": \"function\", \"function\": {{\"name\": \"get_weather\", \"arguments\": \"{{\\\"location\\\": \\\"Beijing\\\"}}\"}}}}]}}\n\nAfter calling tools, you will receive the results and can continue the conversation.");
+
+    if let Some(first_sys) = messages.iter_mut().find(|m| m.role == "system") {
+        if let crate::models::MessageContent::Text(t) = &mut first_sys.content {
+            t.push_str("\n\n");
+            t.push_str(&prompt);
+        }
+    } else {
+        messages.insert(0, ChatMessage {
+            role: "system".to_string(),
+            content: crate::models::MessageContent::Text(prompt),
+        });
+    }
+}
+
 pub async fn chat_completions(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(req): Json<ChatCompletionRequest>,
+    Json(mut req): Json<ChatCompletionRequest>,
 ) -> Result<Response<Body>, ApiError> {
     if req.model.trim().is_empty() || req.messages.is_empty() {
         return Err(ApiError::new(
@@ -395,6 +480,11 @@ pub async fn chat_completions(
             "request must include non-empty model and messages",
         ));
     }
+
+    if let Some(tools) = &req.tools
+        && !tools.is_empty() {
+            inject_tools(&mut req.messages, tools);
+        }
 
     let (token, account) = resolve_deepseek_token(&state, &headers).await?;
     let result = forward_to_deepseek(&state, &token, &req).await;
@@ -404,6 +494,49 @@ pub async fn chat_completions(
     }
 
     result
+}
+
+fn inject_claude_tools(messages: &mut Vec<ChatMessage>, tools: &[Value]) {
+    let mut schemas = Vec::new();
+    for tool in tools {
+        let name = tool.get("name").and_then(|v| v.as_str()).unwrap_or("unknown");
+        let desc = tool.get("description").and_then(|v| v.as_str()).unwrap_or("No description available");
+        let mut info = format!("Tool: {name}\nDescription: {desc}");
+
+        if let Some(schema) = tool.get("input_schema")
+            && let Some(props) = schema.get("properties").and_then(|v| v.as_object()) {
+                let required = schema.get("required").and_then(|v| v.as_array()).map(|a| {
+                    a.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>()
+                }).unwrap_or_default();
+
+                let mut prop_strs = Vec::new();
+                for (k, v) in props {
+                    let p_type = v.get("type").and_then(|t| t.as_str()).unwrap_or("string");
+                    let is_req = if required.contains(&k.as_str()) { " (required)" } else { "" };
+                    prop_strs.push(format!("  - {k}: {p_type}{is_req}"));
+                }
+                if !prop_strs.is_empty() {
+                    info.push_str("\nParameters:\n");
+                    info.push_str(&prop_strs.join("\n"));
+                }
+            }
+        schemas.push(info);
+    }
+
+    let schema_str = schemas.join("\n\n");
+    let prompt = format!("You are Claude, a helpful AI assistant. You have access to these tools:\n\n{schema_str}\n\nWhen you need to use tools, you can call multiple tools in a single response. Use this format:\n\n{{\"tool_calls\": [\n  {{\"name\": \"tool1\", \"input\": {{\"param\": \"value\"}}}},\n  {{\"name\": \"tool2\", \"input\": {{\"param\": \"value\"}}}}\n]}}\n\nIMPORTANT: You can call multiple tools in ONE response. If you need to:\n1. Create a directory - include that in tool_calls\n2. Write a file - include that in the SAME tool_calls array\n3. Run a command - include that in the SAME tool_calls array\n\nExample of multiple tool calls in one response:\n{{\"tool_calls\": [\n  {{\"name\": \"str_replace_editor\", \"input\": {{\"command\": \"create\", \"path\": \"pp1/hello.py\", \"file_text\": \"print('Hello, World!')\"}}}},\n  {{\"name\": \"Bash\", \"input\": {{\"command\": \"python pp1/hello.py\"}}}}\n]}}\n\nExamples:\n- For TodoWrite: {{\"name\": \"TodoWrite\", \"input\": {{\"todos\": [{{\"content\": \"task\", \"status\": \"pending\", \"activeForm\": \"doing task\"}}]}}}}\n- For str_replace_editor: {{\"name\": \"str_replace_editor\", \"input\": {{\"command\": \"create\", \"path\": \"file.py\", \"file_text\": \"code\"}}}}\n- For Bash: {{\"name\": \"Bash\", \"input\": {{\"command\": \"cd /path && python file.py\"}}}}\n\nRemember: Output ONLY the JSON, no other text. The response must start with {{ and end with ]}}");
+
+    if let Some(first_sys) = messages.iter_mut().find(|m| m.role == "system") {
+        if let crate::models::MessageContent::Text(t) = &mut first_sys.content {
+            t.push_str("\n\n");
+            t.push_str(&prompt);
+        }
+    } else {
+        messages.insert(0, ChatMessage {
+            role: "system".to_string(),
+            content: crate::models::MessageContent::Text(prompt),
+        });
+    }
 }
 
 pub async fn claude_messages(
@@ -439,18 +572,31 @@ pub async fn claude_messages(
         });
     }
 
-    let model = if req.model.to_lowercase().contains("reason")
+    if let Some(tools) = &req.tools
+        && !tools.is_empty() {
+            inject_claude_tools(&mut messages, tools);
+        }
+
+    let (fast_model, slow_model) = if let Some(mapping) = &state.config.claude_model_mapping {
+        (mapping.fast.clone(), mapping.slow.clone())
+    } else {
+        ("deepseek-chat".to_string(), "deepseek-chat".to_string())
+    };
+
+    let model = if req.model.to_lowercase().contains("opus")
+        || req.model.to_lowercase().contains("reason")
         || req.model.to_lowercase().contains("slow")
     {
-        "deepseek-reasoner".to_string()
+        slow_model
     } else {
-        "deepseek-chat".to_string()
+        fast_model
     };
 
     let chat_req = ChatCompletionRequest {
         model,
         messages,
         stream: req.stream,
+        tools: req.tools.clone(),
     };
 
     let response = chat_completions(State(state), headers, Json(chat_req)).await?;
@@ -487,4 +633,226 @@ pub async fn claude_messages(
         .header("content-type", "application/json")
         .body(Body::from(claude.to_string()))
         .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+}
+
+pub async fn models() -> impl IntoResponse {
+    let models_list = json!({
+        "object": "list",
+        "data": [
+            {
+                "id": "deepseek-chat",
+                "object": "model",
+                "created": 1677610602,
+                "owned_by": "deepseek",
+                "permission": [],
+            },
+            {
+                "id": "deepseek-reasoner",
+                "object": "model",
+                "created": 1677610602,
+                "owned_by": "deepseek",
+                "permission": [],
+            },
+            {
+                "id": "deepseek-chat-search",
+                "object": "model",
+                "created": 1677610602,
+                "owned_by": "deepseek",
+                "permission": [],
+            },
+            {
+                "id": "deepseek-reasoner-search",
+                "object": "model",
+                "created": 1677610602,
+                "owned_by": "deepseek",
+                "permission": [],
+            },
+        ]
+    });
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "application/json")
+        .body(Body::from(models_list.to_string()))
+        .unwrap()
+}
+
+pub async fn claude_models() -> impl IntoResponse {
+    let models_list = json!({
+        "object": "list",
+        "data": [
+            {
+                "id": "claude-sonnet-4-20250514",
+                "object": "model",
+                "created": 1715635200,
+                "owned_by": "anthropic",
+            },
+            {
+                "id": "claude-sonnet-4-20250514-fast",
+                "object": "model",
+                "created": 1715635200,
+                "owned_by": "anthropic",
+            },
+            {
+                "id": "claude-sonnet-4-20250514-slow",
+                "object": "model",
+                "created": 1715635200,
+                "owned_by": "anthropic",
+            },
+        ]
+    });
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "application/json")
+        .body(Body::from(models_list.to_string()))
+        .unwrap()
+}
+
+pub async fn count_tokens(
+    Json(req): Json<crate::models::CountTokensRequest>,
+) -> Result<Response<Body>, ApiError> {
+    if req.model.trim().is_empty() || req.messages.is_empty() {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "Request must include 'model' and 'messages'.",
+        ));
+    }
+
+    let mut input_tokens = 0;
+
+    if let Some(system) = req.system {
+        input_tokens += system.len() / 4;
+    }
+
+    for message in &req.messages {
+        input_tokens += 2; // Role token overhead
+        if let Some(content) = message.content.as_str() {
+            input_tokens += content.len() / 4;
+        } else if let Some(content_array) = message.content.as_array() {
+            for block in content_array {
+                if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
+                    input_tokens += text.len() / 4;
+                } else if let Some(content) = block.get("content").and_then(|c| c.as_str()) {
+                    input_tokens += content.len() / 4;
+                } else {
+                    input_tokens += block.to_string().len() / 4;
+                }
+            }
+        } else {
+            input_tokens += message.content.to_string().len() / 4;
+        }
+    }
+
+    if let Some(tools) = req.tools {
+        for tool in tools {
+            if let Some(name) = tool.get("name").and_then(|n| n.as_str()) {
+                input_tokens += name.len() / 4;
+            }
+            if let Some(desc) = tool.get("description").and_then(|d| d.as_str()) {
+                input_tokens += desc.len() / 4;
+            }
+            if let Some(schema) = tool.get("input_schema") {
+                input_tokens += schema.to_string().len() / 4;
+            }
+        }
+    }
+
+    let response = json!({
+        "input_tokens": std::cmp::max(1, input_tokens)
+    });
+
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "application/json")
+        .body(Body::from(response.to_string()))
+        .unwrap())
+}
+
+pub async fn stop_stream(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<crate::models::StopStreamRequest>,
+) -> Result<Response<Body>, ApiError> {
+    if req.chat_session_id.trim().is_empty() {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "缺少 chat_session_id 参数",
+        ));
+    }
+
+    let (token, account) = resolve_deepseek_token(&state, &headers).await?;
+
+    let payload = json!({
+        "chat_session_id": req.chat_session_id,
+        "message_id": null
+    });
+
+    let upstream = state
+        .safari_client
+        .post("https://chat.chat.deepseek.com/api/v0/chat/stop_stream")
+        .headers(base_headers(&token))
+        .json(&payload)
+        .send()
+        .await
+        .map_err(|e| ApiError::new(StatusCode::BAD_GATEWAY, format!("stop stream failed: {e}")))?;
+
+    let status = upstream.status();
+    let body = upstream.text().await.unwrap_or_default();
+
+    if let Some(acc) = account {
+        state.release_account(acc).await;
+    }
+
+    if status.is_success() {
+        Ok(Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", "application/json")
+            .body(Body::from(json!({"success": true, "message": "已停止流式响应"}).to_string()))
+            .unwrap())
+    } else {
+        Ok(Response::builder()
+            .status(status)
+            .header("content-type", "application/json")
+            .body(Body::from(json!({"success": false, "message": format!("停止失败: {body}")}).to_string()))
+            .unwrap())
+    }
+}
+
+pub async fn index() -> impl IntoResponse {
+    let html = std::fs::read_to_string("templates/welcome.html").unwrap_or_default();
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "text/html; charset=utf-8")
+        .body(Body::from(html))
+        .unwrap()
+}
+
+pub async fn delete_session(state: AppState, token: String, session_id: String) {
+    let payload = json!({
+        "chat_session_id": session_id
+    });
+    let _ = state
+        .safari_client
+        .post("https://chat.deepseek.com/api/v0/chat_session/delete")
+        .headers(base_headers(&token))
+        .json(&payload)
+        .send()
+        .await;
+}
+
+pub fn detect_and_parse_tool_calls(content: &str) -> (Option<Vec<Value>>, String) {
+    let mut tool_calls = None;
+    let mut remaining = content.to_string();
+
+    if let Some(start_idx) = content.find("{\"tool_calls\":")
+        && let Some(end_idx) = content[start_idx..].find("]}") {
+            let full_end = start_idx + end_idx + 2;
+            let matched = &content[start_idx..full_end];
+            if let Ok(parsed) = serde_json::from_str::<Value>(matched)
+                && let Some(calls) = parsed.get("tool_calls").and_then(|c| c.as_array()) {
+                    tool_calls = Some(calls.clone());
+                    remaining = content.replace(matched, "").trim().to_string();
+                }
+        }
+
+    (tool_calls, remaining)
 }
