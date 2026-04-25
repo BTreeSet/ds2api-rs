@@ -1,5 +1,5 @@
 use anyhow::{Result, anyhow};
-use wasmtime::{AsContextMut, Linker, Memory, Module, Store};
+use wasmtime::{AsContextMut, InstancePre, Memory, Store};
 
 fn checked_write(
     store: impl AsContextMut,
@@ -39,16 +39,15 @@ fn checked_read(
 
 pub fn solve_pow(
     engine: &wasmtime::Engine,
-    module: &Module,
+    instance_pre: &InstancePre<()>,
     challenge: &str,
     salt: &str,
     difficulty: i64,
     expire_at: i64,
 ) -> Result<i64> {
     let mut store = Store::new(engine, ());
-    let linker = Linker::new(engine);
-    let instance = linker
-        .instantiate(&mut store, module)
+    let instance = instance_pre
+        .instantiate(&mut store)
         .map_err(|e| anyhow!("failed to instantiate wasm module: {e}"))?;
 
     let memory = instance

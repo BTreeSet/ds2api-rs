@@ -1,14 +1,11 @@
-use std::{convert::Infallible, time::Duration};
+use std::io;
 
 use anyhow::{Context, anyhow};
 use axum::{
     body::Body,
     extract::{Json, State},
     http::{HeaderMap, HeaderValue, Response, StatusCode},
-    response::{
-        IntoResponse,
-        sse::{Event, KeepAlive, Sse},
-    },
+    response::IntoResponse,
 };
 use base64::Engine as _;
 use futures_util::StreamExt;
@@ -153,13 +150,15 @@ async fn resolve_deepseek_token(
         )
     })?;
 
-    if account.token.clone().unwrap_or_default().trim().is_empty() {
-        login_account(state, &mut account).await.map_err(|e| {
-            ApiError::new(
-                StatusCode::BAD_GATEWAY,
-                format!("account login failed: {e}"),
-            )
-        })?;
+    if account.token.clone().unwrap_or_default().trim().is_empty()
+        && let Err(err) = login_account(state, &mut account).await
+    {
+        let api_error = ApiError::new(
+            StatusCode::BAD_GATEWAY,
+            format!("account login failed: {err}"),
+        );
+        state.release_account(account).await;
+        return Err(api_error);
     }
 
     let token = account.token.clone().ok_or_else(|| {
@@ -292,7 +291,7 @@ async fn create_pow(state: &AppState, token: &str) -> anyhow::Result<String> {
 
     let answer = solve_pow(
         &state.engine,
-        &state.module,
+        state.instance_pre.as_ref(),
         challenge_str,
         salt,
         difficulty,
@@ -358,21 +357,21 @@ async fn forward_to_deepseek(
                 format!("completion request failed: {e}"),
             )
         })?;
+    let status = upstream.status();
 
     if req.stream {
-        let stream = upstream.bytes_stream().map(|chunk| {
-            let evt = match chunk {
-                Ok(bytes) => Event::default().data(String::from_utf8_lossy(&bytes)),
-                Err(err) => Event::default().event("error").data(err.to_string()),
-            };
-            Ok::<Event, Infallible>(evt)
-        });
-
-        let sse = Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(10)));
-        return Ok(sse.into_response());
+        let stream = upstream
+            .bytes_stream()
+            .map(|chunk| chunk.map_err(|err| io::Error::other(err.to_string())));
+        return Response::builder()
+            .status(status)
+            .header("content-type", "text/event-stream")
+            .header("cache-control", "no-cache")
+            .header("connection", "keep-alive")
+            .body(Body::from_stream(stream))
+            .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()));
     }
 
-    let status = upstream.status();
     let body = upstream
         .text()
         .await
@@ -412,6 +411,13 @@ pub async fn claude_messages(
     headers: HeaderMap,
     Json(req): Json<ClaudeRequest>,
 ) -> Result<Response<Body>, ApiError> {
+    if req.stream {
+        return Err(ApiError::new(
+            StatusCode::NOT_IMPLEMENTED,
+            "Streaming translation from DeepSeek to Claude is not yet implemented in Rust.",
+        ));
+    }
+
     let mut messages = Vec::new();
 
     if let Some(system) = req.system.clone().filter(|v| !v.trim().is_empty()) {
@@ -448,10 +454,6 @@ pub async fn claude_messages(
     };
 
     let response = chat_completions(State(state), headers, Json(chat_req)).await?;
-
-    if req.stream {
-        return Ok(response);
-    }
 
     let status = response.status();
     let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)

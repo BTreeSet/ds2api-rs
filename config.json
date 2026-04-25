@@ -1,4 +1,9 @@
 {
+  "bind_address": "0.0.0.0:5001",
+  "cors_origins": [
+    "http://localhost:3000",
+    "http://127.0.0.1:3000"
+  ],
   "keys": [
     "key1",
     "key2"

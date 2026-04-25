@@ -7,6 +7,21 @@ pub struct Config {
     pub keys: Vec<String>,
     #[serde(default)]
     pub accounts: Vec<Account>,
+    #[serde(default = "default_bind_address")]
+    pub bind_address: String,
+    #[serde(default = "default_cors_origins")]
+    pub cors_origins: Vec<String>,
+}
+
+fn default_bind_address() -> String {
+    "0.0.0.0:5001".to_string()
+}
+
+fn default_cors_origins() -> Vec<String> {
+    vec![
+        "http://localhost:3000".to_string(),
+        "http://127.0.0.1:3000".to_string(),
+    ]
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

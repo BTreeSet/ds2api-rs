@@ -6,7 +6,7 @@ use std::{
 
 use anyhow::{Context, Result, anyhow};
 use tokio::sync::Mutex;
-use wasmtime::{Engine, Module};
+use wasmtime::{Engine, InstancePre, Linker, Module};
 use wreq::Client;
 use wreq_util::Emulation;
 
@@ -17,7 +17,8 @@ pub struct AppState {
     pub safari_client: Client,
     pub chrome_client: Client,
     pub engine: Engine,
-    pub module: Module,
+    pub instance_pre: Arc<InstancePre<()>>,
+    pub config: Arc<Config>,
     pub keys: Arc<HashSet<String>>,
     pub accounts: Arc<Mutex<VecDeque<Account>>>,
 }
@@ -41,14 +42,23 @@ impl AppState {
         let engine = Engine::default();
         let module = Module::from_file(&engine, wasm_path)
             .map_err(|e| anyhow!("failed loading wasm module {wasm_path}: {e}"))?;
+        let linker = Linker::<()>::new(&engine);
+        let instance_pre = linker
+            .instantiate_pre(&module)
+            .map_err(|e| anyhow!("failed preparing wasm instance from module: {e}"))?;
+
+        let keys = Arc::new(cfg.keys.iter().cloned().collect::<HashSet<_>>());
+        let accounts = Arc::new(Mutex::new(cfg.accounts.clone().into()));
+        let config = Arc::new(cfg);
 
         Ok(Self {
             safari_client,
             chrome_client,
             engine,
-            module,
-            keys: Arc::new(cfg.keys.into_iter().collect()),
-            accounts: Arc::new(Mutex::new(cfg.accounts.into())),
+            instance_pre: Arc::new(instance_pre),
+            config,
+            keys,
+            accounts,
         })
     }
 
