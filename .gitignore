@@ -1,2 +1,6 @@
 *.bak
 config.json
+
+# Added by cargo
+
+/target
