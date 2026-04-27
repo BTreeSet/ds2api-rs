@@ -409,10 +409,27 @@ async fn forward_to_deepseek(
             .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()));
     }
 
-    let body = upstream
-        .text()
+    let body_bytes = upstream
+        .bytes()
         .await
         .map_err(|e| ApiError::new(StatusCode::BAD_GATEWAY, format!("failed to read body: {e}")))?;
+
+    let mut body = String::from_utf8_lossy(&body_bytes).into_owned();
+
+    if let Ok(mut parsed) = serde_json::from_str::<Value>(&body)
+        && let Some(content) = parsed.pointer("/choices/0/message/content").and_then(|v| v.as_str()) {
+            let (tools, remaining) = detect_and_parse_tool_calls(content);
+            if let Some(tool_calls) = tools {
+                if let Some(message) = parsed.pointer_mut("/choices/0/message") {
+                    message["content"] = Value::String(remaining);
+                    message["tool_calls"] = Value::Array(tool_calls);
+                }
+                if let Some(choice) = parsed.pointer_mut("/choices/0") {
+                    choice["finish_reason"] = Value::String("tool_calls".to_string());
+                }
+                body = parsed.to_string();
+            }
+        }
 
     tokio::spawn(delete_session(s_state, s_token, s_session_id));
 
@@ -618,13 +635,34 @@ pub async fn claude_messages(
         .unwrap_or("")
         .to_string();
 
+    let (tools, remaining) = detect_and_parse_tool_calls(&text);
+
+    let mut content_array = vec![json!({"type": "text", "text": remaining})];
+    let stop_reason = if let Some(tool_calls) = tools {
+        for (i, call) in tool_calls.iter().enumerate() {
+            let name = call.pointer("/function/name").and_then(|v| v.as_str()).unwrap_or("");
+            let args_str = call.pointer("/function/arguments").and_then(|v| v.as_str()).unwrap_or("{}");
+            let args: Value = serde_json::from_str(args_str).unwrap_or_else(|_| json!({}));
+
+            content_array.push(json!({
+                "type": "tool_use",
+                "id": format!("toolu_{}", i),
+                "name": name,
+                "input": args
+            }));
+        }
+        "tool_use"
+    } else {
+        "end_turn"
+    };
+
     let claude = json!({
         "id": format!("msg_{}", uuid::Uuid::new_v4()),
         "type": "message",
         "role": "assistant",
         "model": req.model,
-        "content": [{"type":"text","text": text}],
-        "stop_reason": "end_turn",
+        "content": content_array,
+        "stop_reason": stop_reason,
         "stop_sequence": Value::Null,
     });
 
