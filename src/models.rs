@@ -2,6 +2,18 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 #[derive(Debug, Clone, Deserialize)]
+pub struct ClaudeModelMapping {
+    #[serde(default = "default_deepseek_chat")]
+    pub fast: String,
+    #[serde(default = "default_deepseek_chat")]
+    pub slow: String,
+}
+
+fn default_deepseek_chat() -> String {
+    "deepseek-chat".to_string()
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct Config {
     #[serde(default)]
     pub keys: Vec<String>,
@@ -11,6 +23,8 @@ pub struct Config {
     pub bind_address: String,
     #[serde(default = "default_cors_origins")]
     pub cors_origins: Vec<String>,
+    #[serde(default)]
+    pub claude_model_mapping: Option<ClaudeModelMapping>,
 }
 
 fn default_bind_address() -> String {
@@ -42,6 +56,8 @@ pub struct ChatCompletionRequest {
     pub messages: Vec<ChatMessage>,
     #[serde(default)]
     pub stream: bool,
+    #[serde(default)]
+    pub tools: Option<Vec<Value>>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -87,6 +103,23 @@ pub struct ClaudeRequest {
     pub stream: bool,
     #[serde(default)]
     pub system: Option<String>,
+    #[serde(default)]
+    pub tools: Option<Vec<Value>>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct StopStreamRequest {
+    pub chat_session_id: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct CountTokensRequest {
+    pub model: String,
+    pub messages: Vec<ClaudeMessage>,
+    #[serde(default)]
+    pub system: Option<String>,
+    #[serde(default)]
+    pub tools: Option<Vec<Value>>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

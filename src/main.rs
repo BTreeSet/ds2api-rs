@@ -37,6 +37,12 @@ async fn main() -> anyhow::Result<()> {
         .route("/claude/messages", post(handlers::claude_messages))
         .route("/v1/chat/completions", post(handlers::chat_completions))
         .route("/anthropic/v1/messages", post(handlers::claude_messages))
+        .route("/v1/models", axum::routing::get(handlers::models))
+        .route("/anthropic/v1/models", axum::routing::get(handlers::claude_models))
+        .route("/anthropic/v1/messages/count_tokens", post(handlers::count_tokens))
+        .route("/v1/chat/stop_stream", post(handlers::stop_stream))
+        .route("/anthropic/v1/messages/stop_stream", post(handlers::stop_stream))
+        .route("/", axum::routing::get(handlers::index))
         .with_state(state)
         .layer(cors);
 
